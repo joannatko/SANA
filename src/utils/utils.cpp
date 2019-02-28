@@ -164,16 +164,12 @@ vector<string> fileToStrings(const string& fileName, bool asLines) {
     uint fileNameLen = fileName.size();
     FILE *fp;
     char buf[10240], pipe = 0;
-    if(fileNameLen>=3 && fileName.substr(fileNameLen-3,3) == ".gz"){
-    pipe=1;
-    cerr << "fileToStrings: decompressing using gunzip: " << fileName << endl;
-    string unzip_cmd = "gunzip < " + fileName;
-    fp = popen(unzip_cmd.c_str(), "r");
-    } else if(fileNameLen>=3 && fileName.substr(fileNameLen-3,3) == ".xz"){
-    pipe=1;
-    cerr << "fileToStrings: decompressing using xzcat: " << fileName << endl;
-    string unzip_cmd = "xzcat < " + fileName;
-    fp = popen(unzip_cmd.c_str(), "r");
+    if (fileNameLen>=3 && fileName.substr(fileNameLen-3,3) == ".gz"){
+        fp = decompressFile("gunzip", fileName);
+        pipe=1;
+    } else if (fileNameLen>=3 && fileName.substr(fileNameLen-3,3) == ".xz"){
+        fp = decompressFile("xzcat", fileName);
+        pipe=1;
     } else fp=fopen(fileName.c_str(),"r");
     vector<string> result;
     if(asLines) {
@@ -185,6 +181,15 @@ vector<string> fileToStrings(const string& fileName, bool asLines) {
     if(pipe) pclose(fp);
     else fclose(fp);
     return result;
+}
+
+FILE* decompressFile(const string& decompProg, const string& fileName) {
+    stringstream stream;
+    string command;
+    cerr << "decompressFile: decompressing using " << decompProg << ": " << fileName << endl;
+    stream << decompProg << " < " << fileName;
+    command = stream.str();
+    return popen(command.c_str(), "r");
 }
 
 vector<vector<string> > fileToStringsByLines(const string& fileName) {
@@ -380,7 +385,6 @@ string extractFileName(string s) {
     int pos = s.size()-1;
     while (pos >= 0 and s[pos] != '/') pos--;
     s = s.substr(pos+1);
-    //remove suffix starting with '.'
     return s;
 }
 
@@ -388,8 +392,10 @@ string extractFileName(string s) {
 string extractFileNameNoExtension(string s) {
     s = extractFileName(s);
     //remove suffix starting with '.'
-    uint pos = 0;
-    while (pos < s.size() and s[pos] != '.') pos++;
+    int pos = s.size() - 1;
+    while (pos >= 0 and s[pos] != '.') pos--; //gives position of last "."
+    string suffix = s.substr(pos + 1);
+    if (suffix != "el" and suffix != "elw" and suffix != "gw") throw runtime_error("files must be of type el, elw or gw"); //terminate SANA if invalid file types used
     s = s.substr(0, pos);
     return s;
 }

@@ -15,9 +15,9 @@
 #include "../measures/ExternalWeightedEdgeConservation.hpp"
 
 #ifdef MULTI_PAIRWISE
-#define PARAMS int aligEdges, int g1Edges, int inducedEdges, int g2Edges, double TCSum, int localScoreSum, int n1, double wecSum, double ewecSum, int ncSum, unsigned int trueA_back, double g1WeightedEdges, double g2WeightedEdges, int squaredAligEdges
+#define PARAMS int aligEdges, int g1Edges, int inducedEdges, int g2Edges, double TCSum, int localScoreSum, int n1, double wecSum, double ewecSum, int ncSum, unsigned int trueA_back, double g1WeightedEdges, double g2WeightedEdges, int squaredAligEdges, int exposedEdgesNumer, double edSum, uint pairsCount
 #else
-#define PARAMS int aligEdges, int g1Edges, int inducedEdges, int g2Edges, double TCSum, int localScoreSum, int n1, double wecSum, double ewecSum, int ncSum, unsigned int trueA_back
+#define PARAMS int aligEdges, int g1Edges, int inducedEdges, int g2Edges, double TCSum, int localScoreSum, int n1, double wecSum, double ewecSum, int ncSum, unsigned int trueA_back, double edSum, uint pairsCount
 #endif
 
 class SANA: public Method {
@@ -75,9 +75,9 @@ public:
     double searchSpaceSizeLog();
     string startAligName = "";
     void prune(string& startAligName);
-#ifdef CORES
-    Matrix<ulong> getCoreFreq();
-    vector<ulong> getCoreCount();
+#if 0 //#ifdef CORES
+	vector<ulong> getNumPegSamples() { return numPegSamples; }
+	Matrix<ulong> getPegHoleFreq() { return pegHoleFreq; }
 #endif
     //to compute TDecay automatically
     //returns a value of lambda such that with this TInitial, temperature reaches
@@ -93,10 +93,15 @@ private:
     double lowerTBound = 0;
     double upperTBound = 0;
 
+    //store whether or not most recent move was bad
+    bool wasBadMove = false;
+
     //data structures for the networks
     uint n1;
     uint n2;
     double g1Edges; //stored as double because it appears in division
+    uint pairsCount; // number of combinations of (g1_node_x, g1_node_y) including
+                     // a pair that includes the same node (g1_node_x, g1_node_x)
 #ifdef MULTI_PAIRWISE
     double g1WeightedEdges;
     double g2WeightedEdges;
@@ -106,6 +111,9 @@ private:
     Matrix<MATRIX_UNIT> G2Matrix;
     vector<vector<uint> > G1AdjLists;
     vector<vector<uint> > G2AdjLists;
+
+    Matrix<float>& G1FloatWeights;
+    Matrix<float>& G2FloatWeights;
 
     void initTau(void);
     vector<uint> unLockedNodesG1;
@@ -177,8 +185,9 @@ private:
     //objective function
     MeasureCombination* MC;
     double eval(const Alignment& A);
-    bool scoreComparison(double newAligEdges, double newInducedEdges, double newTCSum, double newLocalScoreSum, double newWecSum, double newNcSum, double& newCurrentScore, double newEwecSum, double newSquaredAligEdges);
+    bool scoreComparison(double newAligEdges, double newInducedEdges, double newTCSum, double newLocalScoreSum, double newWecSum, double newNcSum, double& newCurrentScore, double newEwecSum, double newSquaredAligEdges, double newExposedEdgesNumer, double newEdgeDifferenceSum);
     double ecWeight;
+    double edWeight;
     double s3Weight;
     double icsWeight;
     double wecWeight;
@@ -187,6 +196,7 @@ private:
     double localWeight;
     double mecWeight;
     double sesWeight;
+	double eeWeight;
     double ewecWeight;
     double TCWeight;
 
@@ -223,11 +233,23 @@ private:
     int aligEdgesIncChangeOp(uint source, uint oldTarget, uint newTarget);
     int aligEdgesIncSwapOp(uint source1, uint source2, uint target1, uint target2);
 
+    // to evaluate ED (edge difference score) incrementally
+    bool needEd;
+    double edSum;
+    double edgeDifferenceIncChangeOp(uint source, uint oldTarget, uint newTarget);
+    double edgeDifferenceIncSwapOp(uint source1, uint source2, uint target1, uint target2);
+
     // to evaluate SES incrementally
     bool needSquaredAligEdges;
     int squaredAligEdges;
     int squaredAligEdgesIncChangeOp(uint source, uint oldTarget, uint newTarget);
     int squaredAligEdgesIncSwapOp(uint source1, uint source2, uint target1, uint target2);
+
+	// to evaluate EE incrementally
+    bool needExposedEdges;
+    int exposedEdgesNumer;
+    int exposedEdgesIncChangeOp(uint source, uint oldTarget, uint newTarget);
+    int exposedEdgesIncSwapOp(uint source1, uint source2, uint target1, uint target2);
 
     //to evaluate EC incrementally
     bool needSec;
@@ -271,10 +293,17 @@ private:
     map<string, double>* localScoreSumMap;
     vector<vector<float> > sims;
 #ifdef CORES
-    Matrix<ulong> coreFreq;
-    vector<ulong> coreCount; // number of times this node in g1 was sampled.
-    Matrix<double> weightedCoreFreq; // weighted by pBad below
-    vector<double> totalCoreWeight; // sum of all pBads, for each node in G1.
+    Matrix<ulong> pegHoleFreq;
+    vector<ulong> numPegSamples; // number of times this node in g1 was sampled.
+
+    Matrix<double> weightedPegHoleFreq_orig; // Wayne's original: pBad-weighted, and wherever the peg landed (not nec. better)
+    vector<double> totalWeightedPegWeight_orig;
+
+    Matrix<double> weightedPegHoleFreq_pBad; // weighted by pBad
+    vector<double> totalWeightedPegWeight_pBad;
+
+    Matrix<double> weightedPegHoleFreq_1mpBad; // weighted by 1-pBad
+    vector<double> totalWeightedPegWeight_1mpBad;
 #endif
     map<string, vector<vector<float> > > localSimMatrixMap;
     double localScoreSumIncChangeOp(vector<vector<float> > const & sim, uint const & source, uint const & oldTarget, uint const & newTarget);
@@ -337,7 +366,8 @@ private:
     void initializeParetoFront();
     vector<double> getMeasureScores(double newAligEdges, double newInducedEdges, double newTCSum,
                                      double newLocalScoreSum, double newWecSum, double newNcSum,
-                                     double newEwecSum, double newSquaredAligEdges);
+                                     double newEwecSum, double newSquaredAligEdges, double newExposedEdgesNumer,
+                                     double newEdSum);
     bool dominates(vector<double> &left, vector<double> &right);
     void printParetoFront(const string &fileName);
     void deallocateParetoData();
@@ -358,12 +388,14 @@ private:
     unordered_map<vector<uint>*, vector<uint>*> storedUnassignedgenesG2;
     unordered_map<vector<uint>*, int> storedAligEdges;
     unordered_map<vector<uint>*, int> storedSquaredAligEdges;
+	unordered_map<vector<uint>*, int> storedExposedEdgesNumer;
     unordered_map<vector<uint>*, int> storedInducedEdges;
     unordered_map<vector<uint>*, double> storedLocalScoreSum;
     unordered_map<vector<uint>*, double> storedWecSum;
     unordered_map<vector<uint>*, double> storedEwecSum;
     unordered_map<vector<uint>*, int> storedNcSum;
     unordered_map<vector<uint>*, double> storedTCSum;
+    unordered_map<vector<uint>*, double> storedEdSum;
     unordered_map<vector<uint>*, double> storedCurrentScore;
     unordered_map<vector<uint>*, map<string, double>*> storedLocalScoreSumMap;
     typedef double (*calc)(PARAMS);
@@ -373,7 +405,7 @@ private:
                                               "nodec", "noded", "sequence" };
 
 
-    // Code related with parallel pareto run, these code will be later refactored along with the 
+    // Code related with parallel pareto run, these code will be later refactored along with the
     // rest of SANA's code.
 
     // This construct only contain properties that can't be shared between alignments
@@ -386,11 +418,13 @@ private:
         map<string, double> *localScoreSumMap;
         int aligEdges;
         int squaredAligEdges;
+		int exposedEdgesNumer;
         int inducedEdges;
         double wecSum;
         double ewecSum;
         double ncSum;
         double TCSum;
+        double edSum;
         int localScoreSum;
         double currentScore;
         vector<double> currentScores;
@@ -398,7 +432,7 @@ private:
     };
 
     struct Job {
-        uint id;     // A job's ID equals to its index in the jobs vector.  
+        uint id;     // A job's ID equals to its index in the jobs vector.
                      // Given an id, you can access a job by jobs[id].
         AlignmentInfo info;
 
@@ -415,10 +449,10 @@ private:
     void initializeJobs();
 
     const uint insertionsPerStepOfEachThread = 5;
-    
+
     // There is no need to pass a iter to this function. And perhaps to other functions like simpleRun, simpleParetoRun.
     unordered_set<vector<uint>*>* parallelParetoRun(const Alignment& A, long long int maxExecutionIterations,
-                                                    const string &fileName);   
+                                                    const string &fileName);
     unordered_set<vector<uint>*>* parallelParetoRun(const Alignment& A, double maxExecutionSeconds,
                                                     const string &fileName);
     void startParallelParetoRunByIteration(Job &job, long long int maxExecutionIterations);
@@ -437,12 +471,13 @@ private:
 
     uint G1RandomUnlockedNode(Job &job);
     uint G1RandomUnlockedNode(Job &job, uint source1);
-    uint G1RandomUnlockedNode_Fast(Job &job);    
+    uint G1RandomUnlockedNode_Fast(Job &job);
     uint G2RandomUnlockedNode(Job &job, uint target1);
     uint G2RandomUnlockedNode_Fast(Job &job);
 
     int aligEdgesIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
     int squaredAligEdgesIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
+	int exposedEdgesIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
     int inducedEdgesIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
     double TCIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
     double localScoreSumIncChangeOp(Job &job, vector<vector<float> > const & sim, uint const & source, uint const & oldTarget, uint const & newTarget);
@@ -450,20 +485,21 @@ private:
     double EWECSimCombo(Job &job, uint source, uint target);
     double EWECIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
     int ncIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
-  
+    double edgeDifferenceIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget);
+
+    double edgeDifferenceIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     int aligEdgesIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     double TCIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     int squaredAligEdgesIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
+	int exposedEdgesIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     double WECIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     double EWECIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     int ncIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2);
     double localScoreSumIncSwapOp(Job &job, vector<vector<float> > const & sim, uint const & source1, uint const & source2, uint const & target1, uint const & target2);
 
-
     bool scoreComparison(Job &job, double newAligEdges, double newInducedEdges, double newTCSum, 
                          double newLocalScoreSum, double newWecSum, double newNcSum, double& newCurrentScore, 
-                         double newEwecSum, double newSquaredAligEdges);
-
+                         double newEwecSum, double newSquaredAligEdges, double newExposedEdgesNumer, double newEdgeDifferenceSum);
 
     vector<double> translateScoresToVector(Job &job);
     double trueAcceptingProbability(Job &job);

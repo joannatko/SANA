@@ -26,12 +26,14 @@
 #include "../measures/SymmetricSubstructureScore.hpp"
 #include "../measures/InducedConservedStructure.hpp"
 #include "../measures/EdgeCorrectness.hpp"
+#include "../measures/EdgeDifference.hpp"
 #include "../measures/SquaredEdgeScore.hpp"
 #include "../measures/WeightedEdgeConservation.hpp"
 #include "../measures/TriangleCorrectness.hpp"
 #include "../measures/NodeCorrectness.hpp"
 #include "../measures/SymmetricEdgeCoverage.hpp"
 #include "../measures/localMeasures/Sequence.hpp"
+#include "../measures/EdgeExposure.hpp"
 #include "../utils/NormalDistribution.hpp"
 #include "../utils/LinearRegression.hpp"
 #include "../utils/utils.hpp"
@@ -40,6 +42,14 @@
 #define InitialPBad 0.985
 
 using namespace std;
+
+#define PBAD_HIGH_TEMP_LIMIT 0.99999
+#define PBAD_LOW_TEMP_LIMIT 1e-10
+double LOG10_LOW_TEMP = 0, LOG10_HIGH_TEMP = 0, LOG10_NUM_STEPS = 0;
+
+// All comparisons with nan variables are false, including self-equality. Thus if it's not equal to itself, it's NAN.
+// Note you can't just do (x!=x), because that's always false, NAN or not.
+static bool myNan(double x) { return !(x==x); }
 
 void SANA::initTau(void) {
     /*
@@ -74,12 +84,15 @@ SANA::SANA(Graph* G1, Graph* G2,
 #ifdef MULTI_PAIRWISE
         ,string& startAligName
 #endif
-        ): Method(G1, G2, "SANA_"+MC->toString())
+        ): Method(G1, G2, "SANA_"+MC->toString()),
+           G1FloatWeights(G1->getFloatWeights()),
+           G2FloatWeights(G2->getFloatWeights())
 {
     //data structures for the networks
     n1              = G1->getNumNodes();
     n2              = G2->getNumNodes();
     g1Edges         = G1->getNumEdges();
+    pairsCount      = n1 * (n1 + 1) / 2;
 #ifdef MULTI_PAIRWISE
     g1WeightedEdges = G1->getWeightedNumEdges();
     g2WeightedEdges = G2->getWeightedNumEdges();
@@ -170,11 +183,13 @@ SANA::SANA(Graph* G1, Graph* G2,
     //objective function
     this->MC  = MC;
     ecWeight  = MC->getWeight("ec");
+    edWeight  = MC->getWeight("ed");
     s3Weight  = MC->getWeight("s3");
     icsWeight = MC->getWeight("ics");
     secWeight = MC->getWeight("sec");
     mecWeight = MC->getWeight("mec");
     sesWeight = MC->getWeight("ses");
+	eeWeight = MC->getWeight("ee");
 
     try {
         wecWeight = MC->getWeight("wec");
@@ -211,7 +226,9 @@ SANA::SANA(Graph* G1, Graph* G2,
     restart              = false; //restart scheme
     dynamic_tdecay       = false; //temperature decay dynamically
     needAligEdges        = icsWeight > 0 || ecWeight > 0 || s3Weight > 0 || wecWeight > 0 || secWeight > 0 || mecWeight > 0; //to evaluate EC incrementally
+    needEd               = edWeight > 0; // to evaluate edge difference score incrementally
     needSquaredAligEdges = sesWeight > 0; // to evaluate SES incrementally
+	needExposedEdges	 = eeWeight > 0; // to eval EE incrementally
     needInducedEdges     = s3Weight > 0 || icsWeight > 0; //to evaluate S3 & ICS incrementally
     needWec              = wecWeight > 0; //to evaluate WEC incrementally
     needEwec             = ewecWeight>0; //to evaluate EWEC incrementally
@@ -226,10 +243,14 @@ SANA::SANA(Graph* G1, Graph* G2,
         wecSims                          = (*wecSimsP);
     }
 #ifdef CORES
-    coreFreq = Matrix<ulong>(n1, n2);
-    coreCount       = vector<ulong>(n1, 0);
-    weightedCoreFreq = Matrix<double>(n1, n2);
-    totalCoreWeight = vector<double>(n1, 0);
+    numPegSamples       = vector<ulong>(n1, 0);
+    pegHoleFreq = Matrix<ulong>(n1, n2);
+    weightedPegHoleFreq_orig = Matrix<double>(n1, n2);
+    totalWeightedPegWeight_orig = vector<double>(n1, 0);
+    weightedPegHoleFreq_pBad = Matrix<double>(n1, n2);
+    totalWeightedPegWeight_pBad = vector<double>(n1, 0);
+    weightedPegHoleFreq_1mpBad = Matrix<double>(n1, n2);
+    totalWeightedPegWeight_1mpBad = vector<double>(n1, 0);
 #endif
     //to evaluate local measures incrementally
     if (needLocal) {
@@ -270,18 +291,18 @@ Alignment SANA::getStartingAlignment(){
 
     if(this->startAligName != "")
         randomAlig = Alignment::loadEdgeList(G1, G2, startAligName);
-    else if (G1->hasNodeTypes()) 
+    else if (G1->hasNodeTypes())
         randomAlig = Alignment::randomAlignmentWithNodeType(G1,G2);
     else if (lockFileName != "")
         randomAlig = Alignment::randomAlignmentWithLocking(G1,G2);
     else
         randomAlig = Alignment::random(n1, n2);
-    
+
     // Doing a Rexindexing if required
-#ifdef REINDEX    
-    if (G1->hasNodeTypes()) {    
+#ifdef REINDEX
+    if (G1->hasNodeTypes()) {
     	randomAlig.reIndexBefore_Iterations(G1->getNodeTypes_ReIndexMap());
-    } 
+    }
     else if (lockFileName != "") {
 	    randomAlig.reIndexBefore_Iterations(G1->getLocking_ReIndexMap());
     }
@@ -321,17 +342,19 @@ Alignment SANA::run() {
 	unordered_map<uint,string> G1Index2Name = G1->getIndexToNodeNameMap();
 	unordered_map<uint,string> G2Index2Name = G2->getIndexToNodeNameMap();
 	printf("######## core frequencies#########\n");
-	for(uint i=0; i<n1; i++) for(uint j=0; j<n2; j++) if(coreFreq[i][j]>0)
+	for(uint i=0; i<n1; i++) for(uint j=0; j<n2; j++) if(pegHoleFreq[i][j]>0)
 	{
-	    double unweightdedScore = coreFreq[i][j]/(double)coreCount[i],
-		weightedScore = weightedCoreFreq[i][j]/totalCoreWeight[i];
-	    if(weightedScore > MIN_CORE_SCORE)printf("%s %s  %lu / %lu = %.6f weighted %.6f / %.6f = %.6f\n",
-		G1Index2Name[i].c_str(), G2Index2Name[j].c_str(),
-		coreFreq[i][j], coreCount[i],
-		unweightdedScore,
-		weightedCoreFreq[i][j], totalCoreWeight[i],
-		weightedScore
-		);
+	    double unweightdedScore = pegHoleFreq[i][j]/(double)numPegSamples[i],
+			weightedScore_orig = weightedPegHoleFreq_orig[i][j]/totalWeightedPegWeight_orig[i],
+			weightedScore_pBad = weightedPegHoleFreq_pBad[i][j]/totalWeightedPegWeight_pBad[i],
+			weightedScore_1mpBad = weightedPegHoleFreq_1mpBad[i][j]/totalWeightedPegWeight_1mpBad[i];
+	    if(min(unweightdedScore,weightedScore_orig) > MIN_CORE_SCORE || 
+			min(weightedScore_pBad,weightedScore_1mpBad) > MIN_CORE_SCORE)
+				printf("%s %s %.6f %.6f %.6f %.6f\n",
+					G1Index2Name[i].c_str(), G2Index2Name[j].c_str(),
+					unweightdedScore, weightedScore_orig,
+					weightedScore_pBad, weightedScore_1mpBad
+				);
 	}
 #endif
         return align;
@@ -339,6 +362,7 @@ Alignment SANA::run() {
 }
 
 double ecC(PARAMS) { return double(aligEdges) / g1Edges; }
+double edC(PARAMS) { return EdgeDifference::adjustSumToTargetScore(edSum, pairsCount); } 
 double s3C(PARAMS) { return double(aligEdges) / (g1Edges + inducedEdges - aligEdges); }
 double icsC(PARAMS) { return double(aligEdges) / inducedEdges; }
 double secC(PARAMS) { return double(aligEdges) / (g1Edges + aligEdges) / g2Edges * 0.5; }
@@ -350,10 +374,12 @@ double ncC(PARAMS) { return double(ncSum) / trueA_back; }
 #ifdef MULTI_PAIRWISE
 double mecC(PARAMS) { return double(aligEdges) / (g1WeightedEdges + g2WeightedEdges); }
 double sesC(PARAMS) { return squaredAligEdges; }
+double eeC(PARAMS)  { return 1-exposedEdgesNumer/(double)EdgeExposure::getDenom(); }
 #endif
 
 unordered_set<vector<uint>*>* SANA::paretoRun(const string& fileName) {
     measureCalculation["ec"] = ecC;
+    measureCalculation["ed"] = edC;
     measureCalculation["s3"] = s3C;
     measureCalculation["ics"] = icsC;
     measureCalculation["sec"] = secC;
@@ -365,6 +391,7 @@ unordered_set<vector<uint>*>* SANA::paretoRun(const string& fileName) {
 #ifdef MULTI_PAIRWISE
     measureCalculation["mec"] = mecC;
     measureCalculation["ses"] = sesC;
+	measureCalculation["ee"] = eeC;
 #endif
     cout << "pareto mode running in " << paretoThreads << " number of threads" << endl;
 
@@ -415,16 +442,16 @@ inline uint SANA::G1RandomUnlockedNode(uint source1){
             if(isGene)
                 return G1RandomUnlockedGeneDist(gen);
             else
-                return G1->unlockedGeneCount + G1RandomUnlockedmiRNADist(gen);    
-        #else       
+                return G1->unlockedGeneCount + G1RandomUnlockedmiRNADist(gen);
+        #else
             bool isGene = G1->nodeTypes[source1] == Graph::NODE_TYPE_GENE;
             if(isGene){
                 int index = G1RandomUnlockedGeneDist(gen);
-                return G1->geneIndexList[index]; 
+                return G1->geneIndexList[index];
             }
             else{
                 int index =  G1RandomUnlockedmiRNADist(gen);
-                return G1->miRNAIndexList[index]; 
+                return G1->miRNAIndexList[index];
             }
         #endif
     }
@@ -530,7 +557,7 @@ void SANA::initDataStructures(const Alignment& startA) {
     unassignedNodesG2        = new vector<uint> (n2-n1);
     unassignedgenesG2        = new vector<uint> ();
     unassignedmiRNAsG2       = new vector<uint> ();
-    
+
     if(nodesHaveType){
         cerr << "Seperating unassigned genes and miRNAs in G2" << endl;
         unassignedgenesG2->reserve(G2->geneCount - G1->geneCount);
@@ -562,10 +589,19 @@ void SANA::initDataStructures(const Alignment& startA) {
         aligEdges = startA.numAlignedEdges(*G1, *G2);
     }
 
+    if (needEd) {
+        edSum = EdgeDifference::getEdgeDifferenceSum(G1, G2, startA);
+    }
+
     if (needSquaredAligEdges) {
         squaredAligEdges = startA.numSquaredAlignedEdges(*G1, *G2);
     }
-
+#if MULTI_PAIRWISE
+	if (needExposedEdges)
+	{
+		exposedEdgesNumer = startA.numExposedEdges(*G1, *G2) - EdgeExposure::getMaxEdge();
+	}
+#endif
     if (needInducedEdges) {
         inducedEdges = G2->numNodeInducedSubgraphEdges(*A);
     }
@@ -764,6 +800,7 @@ unordered_set<vector<uint>*>* SANA::simpleParetoRun(const Alignment& startA, lon
 
 unordered_map<string, int> SANA::mapScoresToIndexes() {
     numOfMeasures = MC->numMeasures();
+    assert(numOfMeasures == 1);
     /*numOfMeasures = 8;
     #ifdef MULTI_PAIRWISE
     numOfMeasures = 10;
@@ -811,7 +848,8 @@ vector<double> SANA::translateScoresToVector() {
                                                                               g2Edges, TCSum, localScoreSum, n1,
                                                                               wecSum, ewecSum, ncSum, trueA.back(),
                                                                               g1WeightedEdges, g2WeightedEdges,
-                                                                              squaredAligEdges
+                                                                              squaredAligEdges, exposedEdgesNumer, 
+                                                                              edSum, pairsCount
                                                                             );
     }
 #else
@@ -819,7 +857,8 @@ vector<double> SANA::translateScoresToVector() {
         addScores[scoreNamesToIndexes[measureNames[i]]] = measureCalculation[measureNames[i]]
                                                                             ( aligEdges, g1Edges, inducedEdges,
                                                                               g2Edges, TCSum, localScoreSum, n1,
-                                                                              wecSum, ewecSum, ncSum, trueA.back()
+                                                                              wecSum, ewecSum, ncSum, trueA.back(), 
+                                                                              edSum, pairsCount
                                                                             );
     }
 #endif
@@ -839,7 +878,7 @@ vector<double> SANA::translateScoresToVector() {
     return addScores;
 }
 
-vector<double> SANA::getMeasureScores(double newAligEdges, double newInducedEdges, double newTCSum, double newLocalScoreSum, double newWecSum, double newNcSum, double newEwecSum, double newSquaredAligEdges) {
+vector<double> SANA::getMeasureScores(double newAligEdges, double newInducedEdges, double newTCSum, double newLocalScoreSum, double newWecSum, double newNcSum, double newEwecSum, double newSquaredAligEdges, double newExposedEdgesNumer, double newEdSum) {
     vector<double> addScores(numOfMeasures);
 #ifdef MULTI_PAIRWISE
     for(uint i = 0; i < numOfMeasures; i++) {
@@ -848,7 +887,8 @@ vector<double> SANA::getMeasureScores(double newAligEdges, double newInducedEdge
                                                                               g2Edges, newTCSum, newLocalScoreSum, n1,
                                                                               newWecSum, newEwecSum, newNcSum, trueA.back(),
                                                                               g1WeightedEdges, g2WeightedEdges,
-                                                                              newSquaredAligEdges
+                                                                              newSquaredAligEdges, newExposedEdgesNumer,
+                                                                              newEdSum, pairsCount
                                                                             );
     }
 #else
@@ -856,7 +896,8 @@ vector<double> SANA::getMeasureScores(double newAligEdges, double newInducedEdge
         addScores[scoreNamesToIndexes[measureNames[i]]] = measureCalculation[measureNames[i]]
                                                                             ( newAligEdges, g1Edges, newInducedEdges,
                                                                               g2Edges, newTCSum, newLocalScoreSum, n1,
-                                                                              newWecSum, newEwecSum, newNcSum, trueA.back()
+                                                                              newWecSum, newEwecSum, newNcSum, trueA.back(),
+                                                                              newEdSum, pairsCount
                                                                             );
     }
 #endif
@@ -872,7 +913,7 @@ vector<double> SANA::getMeasureScores(double newAligEdges, double newInducedEdge
 #ifdef MULTI_PAIRWISE
     addScores[scoreNamesToIndexes["mec"]] = double(newAligEdges) / (g1WeightedEdges + g2WeightedEdges);
     addScores[scoreNamesToIndexes["ses"]] = double(newSquaredAligEdges) / SquaredEdgeScore::getDenom();
-#endif*/	
+#endif*/
     return addScores;
 }
 
@@ -880,8 +921,10 @@ void SANA::prepareMeasureDataByAlignment() {
     assert(storedAlignments->find(A) != storedAlignments->end() and "Alignment does not exist in the Pareto front.");
     aligEdges        = (needAligEdges or needSec) ?  storedAligEdges[A] : -1;
     squaredAligEdges = (needSquaredAligEdges) ?  storedSquaredAligEdges[A] : -1;
+	exposedEdgesNumer= (needExposedEdges) ?  storedExposedEdgesNumer[A] : -1;
     inducedEdges     = (needInducedEdges) ?  storedInducedEdges[A] : -1;
     TCSum            = (needTC) ?  storedTCSum[A] : -1;
+    edSum            = (needEd) ?  storedEdSum[A] : -1;
     localScoreSum    = (needLocal) ? storedLocalScoreSum[A] : -1;
     localScoreSumMap = (needLocal) ? new map<string, double>(*storedLocalScoreSumMap[A]) : nullptr;
     wecSum           = (needWec) ?  storedWecSum[A] : -1;
@@ -909,7 +952,7 @@ void SANA::releaseAlignment() {
     delete unassignedNodesG2;
     delete unassignedmiRNAsG2;
     delete unassignedgenesG2;
-    if (needLocal) 
+    if (needLocal)
         delete localScoreSumMap;
 }
 
@@ -945,7 +988,9 @@ void SANA::insertCurrentAlignmentAndData() {
 
     if(needAligEdges or needSec) storedAligEdges[A]        = aligEdges;
     if(needSquaredAligEdges)     storedSquaredAligEdges[A] = squaredAligEdges;
+	if(needExposedEdges)		 storedExposedEdgesNumer[A]= exposedEdgesNumer;
     if(needInducedEdges)         storedInducedEdges[A]     = inducedEdges;
+    if(needEd)                   storedEdSum[A]            = edSum;
     if(needTC)                   storedTCSum[A]            = TCSum;
     if(needLocal)                storedLocalScoreSum[A]    = localScoreSum;
     if(needLocal)                storedLocalScoreSumMap[A] = localScoreSumMap;
@@ -977,8 +1022,10 @@ void SANA::removeAlignmentData(vector<uint>* toRemove) {
 
     if(needAligEdges or needSec) storedAligEdges.erase(toRemove);
     if(needSquaredAligEdges)     storedSquaredAligEdges.erase(toRemove);
+	if(needExposedEdges)		 storedExposedEdgesNumer.erase(toRemove);
     if(needInducedEdges)         storedInducedEdges.erase(toRemove);
     if(needTC)                   storedTCSum.erase(toRemove);
+    if(needEd)                   storedEdSum.erase(toRemove);
     if(needLocal)                storedLocalScoreSum.erase(toRemove);
     if(needLocal)                storedLocalScoreSumMap.erase(toRemove);
     if(needWec)                  storedWecSum.erase(toRemove);
@@ -1039,24 +1086,23 @@ void SANA::deallocateParetoData() {
 
 void SANA::SANAIteration() {
     ++iterationsPerformed;
-    if(G1->hasNodeTypes())
-    {
-	// Choose the type here based on counts (and locking...)
-	// For example if no locking, then prob (gene) >> prob (miRNA)
-	// And if locking, then arrange prob(gene) and prob(miRNA) appropriately
-	int type = /* something clever */ 0;
-	(randomReal(gen) < changeProbability[type]) ? performChange(type) : performSwap(type);
+    if(G1->hasNodeTypes()) {
+        // Choose the type here based on counts (and locking...)
+        // For example if no locking, then prob (gene) >> prob (miRNA)
+        // And if locking, then arrange prob(gene) and prob(miRNA) appropriately
+        int type = /* something clever */ 0;
+        (randomReal(gen) < changeProbability[type]) ? performChange(type) : performSwap(type);
+    } else {
+        (randomReal(gen) < changeProbability[0]) ? performChange(0) : performSwap(0);
     }
-    else
-	(randomReal(gen) < changeProbability[0]) ? performChange(0) : performSwap(0);
 }
 
 void SANA::performChange(int type) {
     uint source       = G1RandomUnlockedNode();
     uint oldTarget    = (*A)[source];
-    
+
     uint newTargetIndex = G2RandomUnlockedNode(oldTarget);
- 
+
     uint newTarget = -1;
     bool isGene = false;
     if(!nodesHaveType)
@@ -1074,19 +1120,18 @@ void SANA::performChange(int type) {
             newTarget = (*unassignedmiRNAsG2)[newTargetIndex];
         }
     }
-    
+
 
     int newAligEdges           = (needAligEdges or needSec) ?  aligEdges + aligEdgesIncChangeOp(source, oldTarget, newTarget) : -1;
+    double newEdSum            = (needEd) ?  edSum + edgeDifferenceIncChangeOp(source, oldTarget, newTarget) : -1;
     double newSquaredAligEdges = (needSquaredAligEdges) ?  squaredAligEdges + squaredAligEdgesIncChangeOp(source, oldTarget, newTarget) : -1;
+	double newExposedEdgesNumer= (needExposedEdges) ? exposedEdgesNumer + exposedEdgesIncChangeOp(source, oldTarget, newTarget) : -1;
     int newInducedEdges        = (needInducedEdges) ?  inducedEdges + inducedEdgesIncChangeOp(source, oldTarget, newTarget) : -1;
     double newTCSum            = (needTC) ?  TCSum + TCIncChangeOp(source, oldTarget, newTarget) : -1;
     double newLocalScoreSum    = (needLocal) ? localScoreSum + localScoreSumIncChangeOp(sims, source, oldTarget, newTarget) : -1;
     double newWecSum           = (needWec) ?  wecSum + WECIncChangeOp(source, oldTarget, newTarget) : -1;
     double newEwecSum          = (needEwec) ?  ewecSum + EWECIncChangeOp(source, oldTarget, newTarget) : -1;
     double newNcSum            = (needNC) ? ncSum + ncIncChangeOp(source, oldTarget, newTarget) : -1;
-
-    
-
 
     map<string, double> newLocalScoreSumMap;
     if (needLocal) {
@@ -1095,9 +1140,31 @@ void SANA::performChange(int type) {
             item.second += localScoreSumIncChangeOp(localSimMatrixMap[item.first], source, oldTarget, newTarget);
     }
 
+
+
     double newCurrentScore = 0;
-    bool makeChange = scoreComparison(newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges);
+    bool makeChange = scoreComparison(newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges, newExposedEdgesNumer, newEdSum);
+
+    #ifdef CORES
+		// Statistics on the emerging core alignment.
+		// only update pBad if it's nonzero; re-use previous nonzero pBad if the current one is zero.
+		uint betterHole = wasBadMove ? oldTarget : newTarget;
+
+        double pBad = trueAcceptingProbability();
+        if(pBad <= 0 || myNan(pBad)) pBad = PBAD_LOW_TEMP_LIMIT;
+
+		numPegSamples[source]++;
+		pegHoleFreq[source][betterHole]++;
+
+		totalWeightedPegWeight_pBad[source] += pBad;
+		weightedPegHoleFreq_pBad[source][betterHole] += pBad;
+
+		totalWeightedPegWeight_1mpBad[source] += 1-pBad;
+		weightedPegHoleFreq_1mpBad[source][betterHole] += 1-pBad;
+	#endif
+
     if (makeChange) {
+
         (*A)[source]                         = newTarget;
 
         if(!nodesHaveType)
@@ -1110,11 +1177,14 @@ void SANA::performChange(int type) {
                 (*unassignedmiRNAsG2)[newTargetIndex] = oldTarget;
             }
         }
-
-
+  
         (*assignedNodesG2)[oldTarget]        = false;
         (*assignedNodesG2)[newTarget]        = true;
+
+
+
         aligEdges                            = newAligEdges;
+        edSum                                = newEdSum;
         inducedEdges                         = newInducedEdges;
         TCSum                                = newTCSum;
         localScoreSum                        = newLocalScoreSum;
@@ -1134,6 +1204,7 @@ void SANA::performChange(int type) {
         }
 #endif
         currentScore     = newCurrentScore;
+		exposedEdgesNumer= newExposedEdgesNumer;
         squaredAligEdges = newSquaredAligEdges;
     }
     if(score == Score::pareto and ((iterationsPerformed % paretoIterations) == 0)) {
@@ -1142,15 +1213,9 @@ void SANA::performChange(int type) {
         vector<double> addScores = translateScoresToVector();
         insertCurrentAndPrepareNewMeasureDataByAlignment(addScores);
     }
-#ifdef CORES
-    // Statistics on the emerging core alignment.
-    // only update pBad if it's nonzero; re-use previous nonzero pBad if the current one is zero.
-    static double pBad;
-    if(trueAcceptingProbability()>0) pBad = trueAcceptingProbability();
-    coreCount[source]++;
-    coreFreq[source][(*A)[source]]++;
-    weightedCoreFreq[source][(*A)[source]] += pBad;
-    totalCoreWeight[source] += pBad;
+#if CORES
+		totalWeightedPegWeight_orig[source] += pBad;
+		weightedPegHoleFreq_orig[source][(*A)[source]] += pBad;
 #endif
 }
 
@@ -1162,10 +1227,12 @@ void SANA::performSwap(int type) {
     int newAligEdges           = (needAligEdges or needSec) ?  aligEdges + aligEdgesIncSwapOp(source1, source2, target1, target2) : -1;
     int newTCSum               = (needTC) ?  TCSum + TCIncSwapOp(source1, source2, target1, target2) : -1;
     double newSquaredAligEdges = (needSquaredAligEdges) ? squaredAligEdges + squaredAligEdgesIncSwapOp(source1, source2, target1, target2) : -1;
+	double newExposedEdgesNumer= (needExposedEdges) ?  exposedEdgesNumer + exposedEdgesIncSwapOp(source1, source2, target1, target2) : -1;
     double newWecSum           = (needWec) ?  wecSum + WECIncSwapOp(source1, source2, target1, target2) : -1;
     double newEwecSum          = (needEwec) ?  ewecSum + EWECIncSwapOp(source1, source2, target1, target2) : -1;
     double newNcSum            = (needNC) ? ncSum + ncIncSwapOp(source1, source2, target1, target2) : -1;
     double newLocalScoreSum    = (needLocal) ? localScoreSum + localScoreSumIncSwapOp(sims, source1, source2, target1, target2) : -1;
+    double newEdSum            = (needEd) ?  edSum + edgeDifferenceIncSwapOp(source1, source2, target1, target2) : -1;
 
     map<string, double> newLocalScoreSumMap;
     if (needLocal) {
@@ -1175,12 +1242,36 @@ void SANA::performSwap(int type) {
     }
 
     double newCurrentScore = 0;
-    bool makeChange = scoreComparison(newAligEdges, inducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges);
+    bool makeChange = scoreComparison(newAligEdges, inducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges, newExposedEdgesNumer, newEdSum);
+
+    #ifdef CORES
+        // Statistics on the emerging core alignment.
+        // only update pBad if it's nonzero; re-use previous nonzero pBad if the current one is zero.
+        double pBad = trueAcceptingProbability();
+        if(pBad <= 0 || myNan(pBad)) pBad = PBAD_LOW_TEMP_LIMIT;
+
+        uint betterDest1 = wasBadMove ? target1 : target2;
+        uint betterDest2 = wasBadMove ? target2 : target1;
+
+        numPegSamples[source1]++; numPegSamples[source2]++;
+        pegHoleFreq[source1][betterDest1]++; pegHoleFreq[source2][betterDest2]++;
+
+        totalWeightedPegWeight_pBad[source1] += pBad;
+        weightedPegHoleFreq_pBad[source1][betterDest1] += pBad;
+        totalWeightedPegWeight_pBad[source2] += pBad;
+        weightedPegHoleFreq_pBad[source2][betterDest2] += pBad;
+
+        totalWeightedPegWeight_1mpBad[source1] += 1-pBad;
+        weightedPegHoleFreq_1mpBad[source1][betterDest1] += 1-pBad;
+        totalWeightedPegWeight_1mpBad[source2] += 1-pBad;
+        weightedPegHoleFreq_1mpBad[source2][betterDest2] += 1-pBad;
+    #endif
 
     if (makeChange) {
         (*A)[source1]       = target2;
         (*A)[source2]       = target1;
         aligEdges           = newAligEdges;
+        edSum               = newEdSum;
         localScoreSum       = newLocalScoreSum;
         TCSum               = newTCSum;
         wecSum              = newWecSum;
@@ -1188,6 +1279,7 @@ void SANA::performSwap(int type) {
         ncSum               = newNcSum;
         currentScore        = newCurrentScore;
         squaredAligEdges    = newSquaredAligEdges;
+		exposedEdgesNumer   = newExposedEdgesNumer;
         if (needLocal)
             (*localScoreSumMap) = newLocalScoreSumMap;
 #if 0
@@ -1207,27 +1299,17 @@ void SANA::performSwap(int type) {
         vector<double> addScores = translateScoresToVector();
         insertCurrentAndPrepareNewMeasureDataByAlignment(addScores);
     }
-#ifdef CORES
-    // Statistics on the emerging core alignment.
-    // only update pBad if it's nonzero; re-use previous nonzero pBad if the current one is zero.
-    static double pBad;
-    if(trueAcceptingProbability()>0) pBad = trueAcceptingProbability();
-
-    coreCount[source1]++;
-    coreFreq[source1][(*A)[source1]]++;
-    weightedCoreFreq[source1][(*A)[source1]] += pBad;
-    totalCoreWeight[source1] += pBad;
-
-    coreCount[source2]++;
-    coreFreq[source2][(*A)[source2]]++;
-    weightedCoreFreq[source2][(*A)[source2]] += pBad;
-    totalCoreWeight[source2] += pBad;
+#if CORES
+        totalWeightedPegWeight_orig[source1] += pBad;
+        weightedPegHoleFreq_orig[source1][(*A)[source1]] += pBad;
+        totalWeightedPegWeight_orig[source2] += pBad;
+        weightedPegHoleFreq_orig[source2][(*A)[source2]] += pBad;
 #endif
 }
 
-bool SANA::scoreComparison(double newAligEdges, double newInducedEdges, double newTCSum, double newLocalScoreSum, double newWecSum, double newNcSum, double& newCurrentScore, double newEwecSum, double newSquaredAligEdges) {
+bool SANA::scoreComparison(double newAligEdges, double newInducedEdges, double newTCSum, double newLocalScoreSum, double newWecSum, double newNcSum, double& newCurrentScore, double newEwecSum, double newSquaredAligEdges, double newExposedEdgesNumer, double newEdgeDifferenceSum) {
     bool makeChange = false;
-    bool wasBadMove = false;
+    wasBadMove = false;
     double badProbability = 0;
 
     switch (score)
@@ -1235,6 +1317,7 @@ bool SANA::scoreComparison(double newAligEdges, double newInducedEdges, double n
     case Score::sum:
     {
         newCurrentScore += ecWeight * (newAligEdges / g1Edges);
+        newCurrentScore += edWeight * EdgeDifference::adjustSumToTargetScore(newEdgeDifferenceSum, pairsCount);
         newCurrentScore += s3Weight * (newAligEdges / (g1Edges + newInducedEdges - newAligEdges));
         newCurrentScore += icsWeight * (newAligEdges / newInducedEdges);
         newCurrentScore += secWeight * (newAligEdges / g1Edges + newAligEdges / g2Edges)*0.5;
@@ -1246,6 +1329,7 @@ bool SANA::scoreComparison(double newAligEdges, double newInducedEdges, double n
 #ifdef MULTI_PAIRWISE
         newCurrentScore += mecWeight * (newAligEdges / (g1WeightedEdges + g2WeightedEdges));
         newCurrentScore += sesWeight * newSquaredAligEdges / SquaredEdgeScore::getDenom();
+		newCurrentScore += eeWeight * (1 - (newExposedEdgesNumer / (double)EdgeExposure::getDenom()));
 #endif
         energyInc = newCurrentScore - currentScore;
         wasBadMove = energyInc < 0;
@@ -1366,13 +1450,14 @@ bool SANA::scoreComparison(double newAligEdges, double newInducedEdges, double n
     }
     case Score::pareto:
     { //This determines whether we should update the current alignment.
-        vector<double> addScores = getMeasureScores(newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newEwecSum, newSquaredAligEdges);
+        vector<double> addScores = getMeasureScores(newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newEwecSum, newSquaredAligEdges, newExposedEdgesNumer, newEdgeDifferenceSum);
         if(dominates(addScores, currentScores))
         {
             currentScores = addScores;
             makeChange = true;
             newCurrentScore = 0;
             newCurrentScore += ecWeight * (newAligEdges / g1Edges);
+            newCurrentScore += edWeight * EdgeDifference::adjustSumToTargetScore(newEdgeDifferenceSum, pairsCount);
             newCurrentScore += s3Weight * (newAligEdges / (g1Edges + newInducedEdges - newAligEdges));
             newCurrentScore += icsWeight * (newAligEdges / newInducedEdges);
             newCurrentScore += TCWeight * (newTCSum);
@@ -1385,6 +1470,7 @@ bool SANA::scoreComparison(double newAligEdges, double newInducedEdges, double n
         {
             newCurrentScore = 0;
             newCurrentScore += ecWeight * (newAligEdges / g1Edges);
+            newCurrentScore += edWeight * EdgeDifference::adjustSumToTargetScore(newEdgeDifferenceSum, pairsCount);
             newCurrentScore += s3Weight * (newAligEdges / (g1Edges + newInducedEdges - newAligEdges));
             newCurrentScore += icsWeight * (newAligEdges / newInducedEdges);
             newCurrentScore += TCWeight * (newTCSum);
@@ -1448,6 +1534,100 @@ int SANA::aligEdgesIncSwapOp(uint source1, uint source2, uint target1, uint targ
     return res;
 }
 
+// 1 2 3 4 5
+// 11 12 13 14 15
+// 22 23 24 25
+// 33 34 35 
+// 44 45
+// 55
+
+// Now change 23
+// - 21 22 23 24 25        // 23 pair should be handled by the first?
+// + 21 22 23 24 25        // 3 matches to a new target
+
+// - 31 33 34 35             
+// + 31 33 34 35             
+double SANA::edgeDifferenceIncSwapOp(uint source1, uint source2, uint target1, uint target2) {
+    if (source1 == source2) return 0;
+
+    // Subtract source1-target1
+    // Add source1-target2
+    double edgeDifferenceIncDiff = 0;
+    double c = 0;
+    for (uint node2 = 0; node2 < n1; ++node2) {
+        double y = -abs(G1FloatWeights[source1][node2] - G2FloatWeights[target1][(*A)[node2]])
+                  - c;
+        double t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t;
+ 
+        uint node2Target = 0;
+        if (node2 == source1) {
+            node2Target = target2;
+        } else if (node2 == source2) {
+            node2Target = target1;
+        } else {
+            node2Target = (*A)[node2];
+        }
+        y = +abs(G1FloatWeights[source1][node2] - G2FloatWeights[target2][node2Target])
+           - c;
+        t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t; 
+   }
+
+    // Subtract source2-target2
+    // Add source2-target1
+    for (uint node2 = 0; node2 < n1; ++node2) {
+        if (node2 == source1) continue;
+        double y = -abs(G1FloatWeights[source2][node2] - G2FloatWeights[target2][(*A)[node2]])
+                  - c;
+        double t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t;
+ 
+        uint node2Target = 0;
+        if (node2 == source2) {
+            node2Target = target1;
+        } else {
+            node2Target = (*A)[node2];
+        }
+        y = +abs(G1FloatWeights[source2][node2] - G2FloatWeights[target1][node2Target])
+           - c;
+        t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t; 
+   }
+
+    return edgeDifferenceIncDiff;
+}
+
+
+double SANA::edgeDifferenceIncChangeOp(uint source, uint oldTarget, uint newTarget) {
+   double edgeDifferenceIncDiff = 0;
+   double c = 0;
+   for (uint node2 = 0; node2 < n1; ++node2) {
+       double y = -abs(G1FloatWeights[source][node2] - G2FloatWeights[oldTarget][(*A)[node2]])
+                  - c;
+       double t = edgeDifferenceIncDiff + y;
+       c = (t - edgeDifferenceIncDiff) - y;
+       edgeDifferenceIncDiff = t;
+
+       uint node2Target = node2 == source ? newTarget : (*A)[node2];
+       y = +abs(G1FloatWeights[source][node2] - G2FloatWeights[newTarget][node2Target])
+                  - c;
+       t = edgeDifferenceIncDiff + y;
+       c = (t - edgeDifferenceIncDiff) - y;
+       edgeDifferenceIncDiff = t; 
+   }
+
+
+   return edgeDifferenceIncDiff;
+}
+
+
+
+
 static int _edgeVal;
 // UGLY GORY HACK BELOW!! Sometimes the edgeVal is crazily wrong, like way above 1,000, when it
 // cannot possibly be greater than the number of networks we're aligning when MULTI_PAIRWISE is on.
@@ -1506,6 +1686,106 @@ int SANA::squaredAligEdgesIncSwapOp(uint source1, uint source2, uint target1, ui
         res += 2 * SQRDIFF(target1,source2);
     }
     return res;
+}
+
+int SANA::exposedEdgesIncChangeOp(uint source, uint oldTarget, uint newTarget) {
+    int ret = 0;
+    uint neighbor;
+    const uint n = G1AdjLists[source].size();
+    for (uint i = 0; i < n; ++i) {
+        neighbor = G1AdjLists[source][i];
+		if (G2Matrix[oldTarget][(*A)[neighbor]] == 0)
+		{
+			--ret;
+		}
+		if (!G2Matrix[newTarget][(*A)[neighbor]])
+		{
+			++ret;
+		}
+    }
+    return ret;
+}
+
+int SANA::exposedEdgesIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget) {
+    int ret = 0;
+    uint neighbor;
+    vector<uint> *A = job.info.A;
+    const uint n = G1AdjLists[source].size();
+    for (uint i = 0; i < n; ++i) {
+        neighbor = G1AdjLists[source][i];
+		if (G2Matrix[oldTarget][(*A)[neighbor]] == 0)
+		{
+			--ret;
+		}
+		if (!G2Matrix[newTarget][(*A)[neighbor]])
+		{
+			++ret;
+		}
+    }
+    return ret;
+}
+
+int SANA::exposedEdgesIncSwapOp(uint source1, uint source2, uint target1, uint target2) {
+    int ret = 0;
+    uint neighbor;
+    const uint n = G1AdjLists[source1].size();
+    uint i = 0;
+    for (; i < n; ++i) {
+        neighbor = G1AdjLists[source1][i];
+        if (G2Matrix[target1][(*A)[neighbor]] == 0)
+		{
+			--ret;
+		}
+		if (!G2Matrix[target2][(*A)[neighbor]])
+		{
+			++ret;
+		}
+    }
+    const uint m = G1AdjLists[source2].size();
+    for (i = 0; i < m; ++i) {
+        neighbor = G1AdjLists[source2][i];
+        if (G2Matrix[target2][(*A)[neighbor]] == 0)
+		{
+			--ret;
+		}
+		if (!G2Matrix[target1][(*A)[neighbor]])
+		{
+			++ret;
+		}
+    }
+    return ret;
+}
+
+int SANA::exposedEdgesIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2) {
+    vector<uint> *A = job.info.A;
+    int ret = 0;
+    uint neighbor;
+    const uint n = G1AdjLists[source1].size();
+    uint i = 0;
+    for (; i < n; ++i) {
+		neighbor = G1AdjLists[source1][i];
+        if (G2Matrix[target1][(*A)[neighbor]] == 1)
+		{
+			--ret;
+		}
+		if (!G2Matrix[target2][(*A)[neighbor]])
+		{
+			++ret;
+		}
+    }
+    const uint m = G1AdjLists[source2].size();
+    for (i = 0; i < m; ++i) {
+		neighbor = G1AdjLists[source2][i];
+        if (G2Matrix[target2][(*A)[neighbor]] == 1)
+		{
+			--ret;
+		}
+		if (!G2Matrix[target1][(*A)[neighbor]])
+		{
+			++ret;
+		}
+    }
+    return ret;
 }
 
 int SANA::inducedEdgesIncChangeOp(uint source, uint oldTarget, uint newTarget) {
@@ -1725,7 +2005,7 @@ void SANA::trackProgress(long long int i, bool end) {
     Alignment Al(*A);
     //original one is commented out for testing sec
     //if (printDetails) cout << " (" << Al.numAlignedEdges(*G1, *G2) << ", " << G2->numNodeInducedSubgraphEdges(*A) << ")";
-    if (printDetails) 
+    if (printDetails)
         cout << "Al.numAlignedEdges = " << Al.numAlignedEdges(*G1, *G2) << ", g1Edges = " <<g1Edges<< " ,g2Edges = "<<g2Edges<< endl;
     if (printScores) {
         SymmetricSubstructureScore S3(G1, G2);
@@ -1802,15 +2082,6 @@ Alignment SANA::runRestartPhases() {
     return simpleRun(candidates[i], minutesFinalist*60, iters[i]);
 }
 
-#ifdef CORES
-vector<ulong> SANA::getCoreCount() {
-    return coreCount;
-}
-Matrix<ulong> SANA::getCoreFreq() {
-    return coreFreq;
-}
-#endif
-
 uint SANA::getLowestIndex() const {
     double lowestScore = candidatesScores[0];
     uint lowestIndex = 0;
@@ -1835,10 +2106,6 @@ uint SANA::getHighestIndex() const {
     return highestIndex;
 }
 
-#define PBAD_HIGH_TEMP_LIMIT 0.99999
-#define PBAD_LOW_TEMP_LIMIT 1e-10
-double LOG10_LOW_TEMP = 0, LOG10_HIGH_TEMP = 0, LOG10_NUM_STEPS = 0;
-
 
 double SANA::temperatureBracket(double LIMIT, bool is_high){
 	int i = 0;
@@ -1856,7 +2123,7 @@ double SANA::temperatureBracket(double LIMIT, bool is_high){
 		}
 	}
 	return is_high ? i+1 : i;
-} 
+}
 
 void SANA::findingUpperLowerTemperatureBound(double & LOG10_LOW_TEMP, double & LOG10_HIGH_TEMP){
 
@@ -1869,7 +2136,7 @@ void SANA::findingUpperLowerTemperatureBound(double & LOG10_LOW_TEMP, double & L
 		//both need to go down
 		while(true){
 			pBadHigh = pForTInitial(pow(10,LOG10_HIGH_TEMP));
-			cout << "Testing High Temperature 10^" << LOG10_HIGH_TEMP << " pBad = " << pBadHigh << endl;				
+			cout << "Testing High Temperature 10^" << LOG10_HIGH_TEMP << " pBad = " << pBadHigh << endl;
 			if (pBadHigh < PBAD_HIGH_TEMP_LIMIT)
 				break;
 			LOG10_HIGH_TEMP--;
@@ -1878,27 +2145,27 @@ void SANA::findingUpperLowerTemperatureBound(double & LOG10_LOW_TEMP, double & L
 		LOG10_LOW_TEMP = LOG10_HIGH_TEMP-1; //We know that LOW TEMP HAS TO BE ATLEAST AS KNOW AS THE HIGH TEMP..Saves us extra computation!
 
 		while(true){
-			pBadLow = pForTInitial(pow(10,LOG10_LOW_TEMP));	
+			pBadLow = pForTInitial(pow(10,LOG10_LOW_TEMP));
 			cout << "Testing Low Temperature 10^" << LOG10_LOW_TEMP << " pBad = " << pBadLow << endl;
 			LOG10_LOW_TEMP--;
 			if(pBadLow < PBAD_LOW_TEMP_LIMIT)
 				break;
-		}	
-		
+		}
+
 	}
 	else if (pBadLow < PBAD_LOW_TEMP_LIMIT && pBadHigh < PBAD_HIGH_TEMP_LIMIT){
 		//both need to go up
 		while(true){
-			pBadLow = pForTInitial(pow(10,LOG10_LOW_TEMP));	
+			pBadLow = pForTInitial(pow(10,LOG10_LOW_TEMP));
 			cout << "Testing Low Temperature 10^" << LOG10_LOW_TEMP << " pBad = " << pBadLow << endl;
 			if(pBadLow > PBAD_LOW_TEMP_LIMIT)
 				break;
 			LOG10_LOW_TEMP++;
-		}	
+		}
 		LOG10_HIGH_TEMP = LOG10_LOW_TEMP+1; //We know that LOW TEMP HAS TO BE ATLEAST AS KNOW AS THE HIGH TEMP..Saves us extra computation!
 		while(true){
 			pBadHigh = pForTInitial(pow(10,LOG10_HIGH_TEMP));
-			cout << "Testing High Temperature 10^" << LOG10_HIGH_TEMP << " pBad = " << pBadHigh << endl;				
+			cout << "Testing High Temperature 10^" << LOG10_HIGH_TEMP << " pBad = " << pBadHigh << endl;
 			LOG10_HIGH_TEMP++;
 			if (pBadHigh > PBAD_HIGH_TEMP_LIMIT)
 				break;
@@ -1916,8 +2183,8 @@ void SANA::searchTemperaturesByLinearRegression() {
     //if(score == "pareto") //Running in pareto mode makes this function really slow
     //	return;             //and I don't know why, but sometimes I disable using this.
     //                      //otherwise my computer is very slow.
-	
-	findingUpperLowerTemperatureBound(LOG10_LOW_TEMP, LOG10_HIGH_TEMP); //abstraction: Finds the initial lower and upper bound 
+
+	findingUpperLowerTemperatureBound(LOG10_LOW_TEMP, LOG10_HIGH_TEMP); //abstraction: Finds the initial lower and upper bound
 
 	LOG10_NUM_STEPS = abs(LOG10_LOW_TEMP) + abs(LOG10_HIGH_TEMP);
 
@@ -1928,7 +2195,7 @@ void SANA::searchTemperaturesByLinearRegression() {
     cout << "Sampling " << 1+LOG10_NUM_STEPS << " pbads from 1E" << LOG10_LOW_TEMP<< " to 1E" << LOG10_HIGH_TEMP <<" for linear regression" << endl;
     int T_i;
     double log_temp;
-    
+
 	for(T_i = 0; T_i <= LOG10_NUM_STEPS; T_i++){
 	log_temp = LOG10_LOW_TEMP + T_i*(LOG10_HIGH_TEMP-LOG10_LOW_TEMP)/LOG10_NUM_STEPS;
         pbadMap[log_temp] = pForTInitial(pow(10, log_temp));
@@ -2522,13 +2789,12 @@ void SANA::prune(string& startAligName) {
     std::cerr << "Starting to prune using " <<  startAligName << std::endl;
     uint n = G1->getNumNodes();
     vector<uint> alignment;
-    
+
     stringstream errorMsg;
     string format = startAligName.substr(startAligName.size()-6);
-    assert(format == ".align"); // currently only edgelist format is supported
+    assert(format == ".align"); // currently only 2-column format is supported
 
 
-    
     Alignment align =  Alignment::loadEdgeList(G1, G2, startAligName);
 #ifdef REINDEX
     if(G1->hasNodeTypes())
@@ -2536,10 +2802,10 @@ void SANA::prune(string& startAligName) {
     else if (lockFileName != "")
         align.reIndexBefore_Iterations(G1->getLocking_ReIndexMap());
 
-#endif        
+#endif
 
 
-    unordered_map<uint, uint> reIndexedMap;    
+    unordered_map<uint, uint> reIndexedMap;
     // This is when no reIndexing is done, just to simplify the code
     for(uint i=0;i<n;i++)
         reIndexedMap[i] = i;
@@ -2550,9 +2816,9 @@ void SANA::prune(string& startAligName) {
     else if (lockFileName != "")
         reIndexedMap = G1->getLocking_ReIndexMap();
 #endif
-    
+
     alignment = align.getMapping();
-            
+
     std::cerr << alignment.size() << " " << n << std::endl;
     if ((uint)alignment.size() != n) {
         errorMsg << "Alignment size (" << alignment.size() << ") less than number of nodes (" << n <<")";
@@ -2596,7 +2862,7 @@ void SANA::prune(string& startAligName) {
 #endif
 
 
-// Code related with parallel pareto run, these code will be later refactored along with the 
+// Code related with parallel pareto run, these code will be later refactored along with the
 // rest of SANA's code.
 
 void SANA::performChange(Job &job, int type) {
@@ -2606,7 +2872,7 @@ void SANA::performChange(Job &job, int type) {
     uint source = G1RandomUnlockedNode(job);
     uint oldTarget    = (*A)[source];
     uint newTargetIndex = G2RandomUnlockedNode(job, oldTarget);
-    
+
     uint newTarget = -1;
     bool isGene = false;
     if(!nodesHaveType)
@@ -2627,12 +2893,14 @@ void SANA::performChange(Job &job, int type) {
 
     int newAligEdges           = (needAligEdges or needSec) ?  info.aligEdges + aligEdgesIncChangeOp(job, source, oldTarget, newTarget) : -1;
     double newSquaredAligEdges = (needSquaredAligEdges) ?  info.squaredAligEdges + squaredAligEdgesIncChangeOp(job, source, oldTarget, newTarget) : -1;
+	double newExposedEdgesNumer= (needExposedEdges) ?  info.exposedEdgesNumer + exposedEdgesIncChangeOp(job, source, oldTarget, newTarget) : -1;
     int newInducedEdges        = (needInducedEdges) ?  info.inducedEdges + inducedEdgesIncChangeOp(job, source, oldTarget, newTarget) : -1;
     double newTCSum            = (needTC) ?  info.TCSum + TCIncChangeOp(job, source, oldTarget, newTarget) : -1;
     double newLocalScoreSum    = (needLocal) ? info.localScoreSum + localScoreSumIncChangeOp(job, sims, source, oldTarget, newTarget) : -1;
     double newWecSum           = (needWec) ?  info.wecSum + WECIncChangeOp(job, source, oldTarget, newTarget) : -1;
     double newEwecSum          = (needEwec) ?  info.ewecSum + EWECIncChangeOp(job, source, oldTarget, newTarget) : -1;
     double newNcSum            = (needNC) ? info.ncSum + ncIncChangeOp(job, source, oldTarget, newTarget) : -1;
+    double newEdSum            = (needEd) ? info.edSum + edgeDifferenceIncChangeOp(job, source, oldTarget, newTarget) : -1;
 
     map<string, double> newLocalScoreSumMap;
     if (needLocal) {
@@ -2642,8 +2910,27 @@ void SANA::performChange(Job &job, int type) {
     }
 
     double newCurrentScore = 0;
-    bool makeChange = scoreComparison(job, newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges);
+    bool makeChange = scoreComparison(job, newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges, newExposedEdgesNumer, newEdSum);
+
+    #ifdef CORES
+		// Statistics on the emerging core alignment.
+		// only update pBad if it's nonzero; re-use previous nonzero pBad if the current one is zero.
+		uint betterHole = wasBadMove ? oldTarget : newTarget;
+		double pBad = trueAcceptingProbability();
+        if(pBad <= 0 || myNan(pBad)) pBad = PBAD_LOW_TEMP_LIMIT;
+
+		numPegSamples[source]++;
+		pegHoleFreq[source][betterHole]++;
+
+		totalWeightedPegWeight_pBad[source] += pBad;
+		weightedPegHoleFreq_pBad[source][betterHole] += pBad;
+
+		totalWeightedPegWeight_1mpBad[source] += 1-pBad;
+		weightedPegHoleFreq_1mpBad[source][betterHole] += 1-pBad;
+	#endif
+
     if (makeChange) {
+
        (*A)[source]                         = newTarget;
 
        if(!nodesHaveType)
@@ -2666,12 +2953,14 @@ void SANA::performChange(Job &job, int type) {
        info.wecSum                               = newWecSum;
        info.ewecSum                              = newEwecSum;
        info.ncSum                                = newNcSum;
+       info.edSum                                = newEdSum;
        info.currentScore = newCurrentScore;
        info.squaredAligEdges = newSquaredAligEdges;
+	   info.exposedEdgesNumer = newExposedEdgesNumer;
 
        if (needLocal) {
            (*info.localScoreSumMap) = newLocalScoreSumMap;
-       }      
+       }
 #if 0
        if (randomReal(job.gen) <= 1) {
            double foo = eval(*A);
@@ -2684,8 +2973,10 @@ void SANA::performChange(Job &job, int type) {
 #endif
     }
 
-   // CORE code is not implemented here, as the original simpleParetoRun
-   // function never access CORE code after pareto run finishes.
+#if CORES
+	totalWeightedPegWeight_orig[source] += pBad;
+	weightedPegHoleFreq_orig[source][(*A)[source]] += pBad;
+#endif
 }
 
 void SANA::performSwap(Job &job, int type) {
@@ -2699,10 +2990,12 @@ void SANA::performSwap(Job &job, int type) {
     int newAligEdges           = (needAligEdges or needSec) ?  info.aligEdges + aligEdgesIncSwapOp(job, source1, source2, target1, target2) : -1;
     int newTCSum               = (needTC) ?  info.TCSum + TCIncSwapOp(job, source1, source2, target1, target2) : -1;
     double newSquaredAligEdges = (needSquaredAligEdges) ? info.squaredAligEdges + squaredAligEdgesIncSwapOp(job, source1, source2, target1, target2) : -1;
+	double newExposedEdgesNumer= (needExposedEdges) ? info.exposedEdgesNumer + exposedEdgesIncSwapOp(job, source1, source2, target1, target2) : -1;
     double newWecSum           = (needWec) ?  info.wecSum + WECIncSwapOp(job, source1, source2, target1, target2) : -1;
     double newEwecSum          = (needEwec) ?  info.ewecSum + EWECIncSwapOp(job, source1, source2, target1, target2) : -1;
     double newNcSum            = (needNC) ? info.ncSum + ncIncSwapOp(job, source1, source2, target1, target2) : -1;
     double newLocalScoreSum    = (needLocal) ? info.localScoreSum + localScoreSumIncSwapOp(job, sims, source1, source2, target1, target2) : -1;   
+    double newEdSum            = (needEd) ? info.edSum + edgeDifferenceIncSwapOp(job, source1, source2, target1, target2) : -1;
 
     map<string, double> newLocalScoreSumMap;
     if (needLocal) {
@@ -2712,7 +3005,29 @@ void SANA::performSwap(Job &job, int type) {
     }
 
     double newCurrentScore = 0;
-    bool makeChange = scoreComparison(job, newAligEdges, info.inducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges);
+    bool makeChange = scoreComparison(job, newAligEdges, info.inducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newCurrentScore, newEwecSum, newSquaredAligEdges, newExposedEdgesNumer, newEdSum);
+    #ifdef CORES
+        // Statistics on the emerging core alignment.
+        // only update pBad if it's nonzero; re-use previous nonzero pBad if the current one is zero.
+        double pBad = trueAcceptingProbability();
+        if(pBad <= 0 || myNan(pBad)) pBad = PBAD_LOW_TEMP_LIMIT;
+
+        uint betterDest1 = wasBadMove ? target1 : target2;
+        uint betterDest2 = wasBadMove ? target2 : target1;
+
+        numPegSamples[source1]++; numPegSamples[source2]++;
+        pegHoleFreq[source1][betterDest1]++; pegHoleFreq[source2][betterDest2]++;
+
+        totalWeightedPegWeight_pBad[source1] += pBad;
+        weightedPegHoleFreq_pBad[source1][betterDest1] += pBad;
+        totalWeightedPegWeight_pBad[source2] += pBad;
+        weightedPegHoleFreq_pBad[source2][betterDest2] += pBad;
+
+        totalWeightedPegWeight_1mpBad[source1] += 1-pBad;
+        weightedPegHoleFreq_1mpBad[source1][betterDest1] += 1-pBad;
+        totalWeightedPegWeight_1mpBad[source2] += 1-pBad;
+        weightedPegHoleFreq_1mpBad[source2][betterDest2] += 1-pBad;
+    #endif
     if (makeChange) {
         (*A)[source1]       = target2;
         (*A)[source2]       = target1;
@@ -2724,6 +3039,8 @@ void SANA::performSwap(Job &job, int type) {
         info.ncSum               = newNcSum;
         info.currentScore        = newCurrentScore;
         info.squaredAligEdges    = newSquaredAligEdges;
+        info.edSum               = newEdSum;
+		info.exposedEdgesNumer	 = newExposedEdgesNumer;
         if (needLocal)
             (*info.localScoreSumMap) = newLocalScoreSumMap;
 #if 0
@@ -2737,9 +3054,12 @@ void SANA::performSwap(Job &job, int type) {
         }
 #endif
    }
-
-   // CORE code is not implemented here, as the original simpleParetoRun
-   // function never access CORE code after pareto run finishes.
+#if CORES
+        totalWeightedPegWeight_orig[source1] += pBad;
+        weightedPegHoleFreq_orig[source1][(*A)[source1]] += pBad;
+        totalWeightedPegWeight_orig[source2] += pBad;
+        weightedPegHoleFreq_orig[source2][(*A)[source2]] += pBad;
+#endif
 }
 
 void SANA::parallelParetoSANAIteration(Job &job) {
@@ -2752,7 +3072,7 @@ void SANA::parallelParetoSANAIteration(Job &job) {
         int type = /* something clever */ 0;
         (randomReal(job.gen) < changeProbability[type]) ? performChange(job, type) : performSwap(job, type);
     }
-        (randomReal(job.gen) < changeProbability[0]) ? performChange(job, 0) : performSwap(job, 0); 
+        (randomReal(job.gen) < changeProbability[0]) ? performChange(job, 0) : performSwap(job, 0);
 }
 
 
@@ -2776,9 +3096,9 @@ void SANA::startParallelParetoRunByIteration(Job &job, long long int maxExecutio
             trackProgress(job);
             iterOfLastTrackProgress = sharedIter;
         }
-        
+
         //uint startIter = sharedIter;
-        
+
         sharedIter += iterationsPerStepForEachThread;
 
         getJobMutex.unlock();
@@ -2788,7 +3108,7 @@ void SANA::startParallelParetoRunByIteration(Job &job, long long int maxExecutio
             //job.Temperature = temperatureFunction(startIter + i, TInitial, TDecay);
 
             // Temperature is based on how much iterations each thread has yet performed.
-            job.Temperature = temperatureFunction(job.iterationsPerformed, TInitial, TDecay); 
+            job.Temperature = temperatureFunction(job.iterationsPerformed, TInitial, TDecay);
 
             parallelParetoSANAIteration(job);
         }
@@ -2806,13 +3126,13 @@ unordered_set<vector<uint>*>* SANA::parallelParetoRun(const Alignment& startA, l
     score = Score::pareto;
     initializeParetoFront();
     initializeJobs();
-    
- 
+
+
     startTime = chrono::steady_clock::now();
     vector<thread> threads;
     for (uint i = 0; i < paretoThreads; ++i) {
-        threads.push_back(thread(&SANA::startParallelParetoRunByIteration, this, ref(jobs[i]), maxExecutionIterations)); 
-    } 
+        threads.push_back(thread(&SANA::startParallelParetoRunByIteration, this, ref(jobs[i]), maxExecutionIterations));
+    }
 
     for (thread &t: threads) {
         t.join();
@@ -2832,7 +3152,7 @@ void SANA::startParallelParetoRunByTime(Job &job, double maxExecutionSeconds) {
 
     while (true) {
         getJobMutex.lock();
-        
+
         if (getElapsedTime() / paretoThreads > maxExecutionSeconds) {
             getJobMutex.unlock();
             return ;
@@ -2848,7 +3168,7 @@ void SANA::startParallelParetoRunByTime(Job &job, double maxExecutionSeconds) {
             trackProgress(job);
             iterOfLastTrackProgress = sharedIter;
         }
-        
+
         //uint startIter = sharedIter;
 
         sharedIter += iterationsPerStepForEachThread;
@@ -2860,7 +3180,7 @@ void SANA::startParallelParetoRunByTime(Job &job, double maxExecutionSeconds) {
             //job.Temperature = temperatureFunction(startIter + i, TInitial, TDecay);
 
             // Temperature is based on how much iterations each thread has yet performed.
-            job.Temperature = temperatureFunction(job.iterationsPerformed, TInitial, TDecay); 
+            job.Temperature = temperatureFunction(job.iterationsPerformed, TInitial, TDecay);
 
             parallelParetoSANAIteration(job);
         }
@@ -2878,12 +3198,12 @@ unordered_set<vector<uint>*>* SANA::parallelParetoRun(const Alignment& startA, d
     score = Score::pareto;
     initializeParetoFront();
     initializeJobs();
-    
+
     startTime = chrono::steady_clock::now();
     vector<thread> threads;
     for (uint i = 0; i < paretoThreads; ++i) {
-        threads.push_back(thread(&SANA::startParallelParetoRunByTime, this, ref(jobs[i]), maxExecutionSeconds)); 
-    } 
+        threads.push_back(thread(&SANA::startParallelParetoRunByTime, this, ref(jobs[i]), maxExecutionSeconds));
+    }
 
     for (thread &t: threads) {
         t.join();
@@ -2914,7 +3234,7 @@ void SANA::releaseAlignment(Job &job) {
     delete info.unassignedNodesG2;
     delete info.unassignedmiRNAsG2;
     delete info.unassignedgenesG2;
-    if (needLocal) 
+    if (needLocal)
         delete info.localScoreSumMap;
 }
 
@@ -2935,7 +3255,7 @@ void SANA::attemptInsertAlignment(Job &job) {
         releaseAlignment(job);
     }
 
-    assert(paretoFront.size() == storedAlignments->size() and "Number of elements in paretoFront and storedAlignments don't match.");  
+    assert(paretoFront.size() == storedAlignments->size() and "Number of elements in paretoFront and storedAlignments don't match.");
 }
 
 void SANA::storeAlignment(Job &job) {
@@ -2954,8 +3274,10 @@ void SANA::storeAlignment(Job &job) {
 
     if(needAligEdges or needSec) storedAligEdges[A]        = info.aligEdges;
     if(needSquaredAligEdges)     storedSquaredAligEdges[A] = info.squaredAligEdges;
+	if(needExposedEdges)		 storedExposedEdgesNumer[A]= info.exposedEdgesNumer;
     if(needInducedEdges)         storedInducedEdges[A]     = info.inducedEdges;
     if(needTC)                   storedTCSum[A]            = info.TCSum;
+    if(needEd)                   storedEdSum[A]            = info.edSum;
     if(needLocal)                storedLocalScoreSum[A]    = info.localScoreSum;
     if(needLocal)                storedLocalScoreSumMap[A] = info.localScoreSumMap;
     if(needWec)                  storedWecSum[A]           = info.wecSum;
@@ -2969,8 +3291,10 @@ void SANA::copyAlignmentFromStorage(Job &job, vector<uint> *A) {
     assert(storedAlignments->find(A) != storedAlignments->end() and "Alignment does not exist in the Pareto front.");
     info.aligEdges        = (needAligEdges or needSec) ?  storedAligEdges[A] : -1;
     info.squaredAligEdges = (needSquaredAligEdges) ?  storedSquaredAligEdges[A] : -1;
+	info.exposedEdgesNumer= (needExposedEdges) ? storedExposedEdgesNumer[A] : -1;
     info.inducedEdges     = (needInducedEdges) ?  storedInducedEdges[A] : -1;
     info.TCSum            = (needTC) ?  storedTCSum[A] : -1;
+    info.edSum            = (needEd) ?  storedEdSum[A] : -1;
     info.localScoreSum    = (needLocal) ? storedLocalScoreSum[A] : -1;
     info.localScoreSumMap = (needLocal) ? new map<string, double>(*storedLocalScoreSumMap[A]) : nullptr;
     info.wecSum           = (needWec) ?  storedWecSum[A] : -1;
@@ -3007,7 +3331,8 @@ vector<double> SANA::translateScoresToVector(Job &job) {
                                                                     g2Edges, info.TCSum, info.localScoreSum, n1,
                                                                     info.wecSum, info.ewecSum, info.ncSum, trueA.back(),
                                                                     g1WeightedEdges, g2WeightedEdges,
-                                                                    info.squaredAligEdges
+                                                                    info.squaredAligEdges, info.exposedEdgesNumer,
+                                                                    info.edSum, pairsCount
                                                                    );
     }
 #else
@@ -3015,7 +3340,8 @@ vector<double> SANA::translateScoresToVector(Job &job) {
         addScores[scoreNamesToIndexes[measureNames[i]]] = measureCalculation[measureNames[i]]
                                                                   ( info.aligEdges, g1Edges, info.inducedEdges,
                                                                     g2Edges, info.TCSum, info.localScoreSum, n1,
-                                                                    info.wecSum, info.ewecSum, info.ncSum, trueA.back()
+                                                                    info.wecSum, info.ewecSum, info.ncSum, trueA.back(),
+                                                                    info.edSum, pairsCount
                                                                   );
     }
 #endif
@@ -3042,7 +3368,7 @@ void SANA::trackProgress(Job &job) {
     Alignment Al(*info.A);
     //original one is commented out for testing sec
     //if (printDetails) cout << " (" << Al.numAlignedEdges(*G1, *G2) << ", " << G2->numNodeInducedSubgraphEdges(*A) << ")";
-    if (printDetails) 
+    if (printDetails)
         cout << "Al.numAlignedEdges = " << Al.numAlignedEdges(*G1, *G2) << ", g1Edges = " <<g1Edges<< " ,g2Edges = "<<g2Edges<< endl;
     if (printScores) {
         SymmetricSubstructureScore S3(G1, G2);
@@ -3142,7 +3468,7 @@ int SANA::inducedEdgesIncChangeOp(Job &job, uint source, uint oldTarget, uint ne
     res -= G2Matrix[oldTarget][newTarget];
     return res;
 }
-    
+
 double SANA::TCIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget) {
     vector<uint> *A = job.info.A;
     double deltaTriangles = 0;
@@ -3219,22 +3545,22 @@ int SANA::ncIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget) {
     if (trueA[source] == newTarget) change += 1;
     return change;
 }
-mutex quick_lock;
 bool SANA::scoreComparison(Job &job, double newAligEdges, double newInducedEdges, double newTCSum, 
                          double newLocalScoreSum, double newWecSum, double newNcSum, double& newCurrentScore, 
-                         double newEwecSum, double newSquaredAligEdges) {
+                         double newEwecSum, double newSquaredAligEdges, double newExposedEdgesNumer, double newEdgeDifferenceSum) {
     bool makeChange = false;
-    bool wasBadMove = false;
+    wasBadMove = false;
     double badProbability = 0;
 
     AlignmentInfo &info = job.info;
-    
-    vector<double> addScores = getMeasureScores(newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newEwecSum, newSquaredAligEdges);
+
+    vector<double> addScores = getMeasureScores(newAligEdges, newInducedEdges, newTCSum, newLocalScoreSum, newWecSum, newNcSum, newEwecSum, newSquaredAligEdges, newExposedEdgesNumer, newEdgeDifferenceSum);
     if(dominates(addScores, info.currentScores)) {
         info.currentScores = addScores;
         makeChange = true;
         newCurrentScore = 0;
         newCurrentScore += ecWeight * (newAligEdges / g1Edges);
+        newCurrentScore += edWeight * EdgeDifference::adjustSumToTargetScore(newEdgeDifferenceSum, pairsCount);
         newCurrentScore += s3Weight * (newAligEdges / (g1Edges + newInducedEdges - newAligEdges));
         newCurrentScore += icsWeight * (newAligEdges / newInducedEdges);
         newCurrentScore += TCWeight * (newTCSum);
@@ -3245,6 +3571,7 @@ bool SANA::scoreComparison(Job &job, double newAligEdges, double newInducedEdges
     } else {
         newCurrentScore = 0;
         newCurrentScore += ecWeight * (newAligEdges / g1Edges);
+        newCurrentScore += edWeight * EdgeDifference::adjustSumToTargetScore(newEdgeDifferenceSum, pairsCount);
         newCurrentScore += s3Weight * (newAligEdges / (g1Edges + newInducedEdges - newAligEdges));
         newCurrentScore += icsWeight * (newAligEdges / newInducedEdges);
         newCurrentScore += TCWeight * (newTCSum);
@@ -3258,8 +3585,7 @@ bool SANA::scoreComparison(Job &job, double newAligEdges, double newInducedEdges
         makeChange = (addScores[info.currentMeasure] > info.currentScores[info.currentMeasure] or job.energyInc >= 0 or randomReal(job.gen) <= exp(job.energyInc / job.Temperature));
         if(makeChange) info.currentScores = addScores;
     }
-
-    if (wasBadMove && (job.iterationsPerformed % 512 == 0 || (TCWeight > 0 && job.iterationsPerformed % 32 == 0))) { //this will never run in the case of iterationsPerformed never being changed so that it doesn't greatly slow down the program if for some reason iterationsPerformed doesn't need to be changed.
+    if (((TCWeight > 0 && job.iterationsPerformed % 32 == 0) || job.iterationsPerformed % 512 == 0) && wasBadMove) { //this will never run in the case of iterationsPerformed never being changed so that it doesn't greatly slow down the program if for some reason iterationsPerformed doesn't need to be changed.
        if (job.sampledProbability.size() == 1000) {
            job.sampledProbability.erase(job.sampledProbability.begin());
        }
@@ -3364,7 +3690,7 @@ double SANA::TCIncSwapOp(Job &job, uint source1, uint source2, uint target1, uin
                     //G2 HAD a triangle
                     deltaTriangles -= 1;
                 }
-                
+
                 if((G2Matrix[target1][(*A)[neighbor1]] and G2Matrix[target1][(*A)[neighbor2]] and G2Matrix[(*A)[neighbor1]][(*A)[neighbor2]])
                    || (neighbor1 == source1 and G2Matrix[target1][target2] and G2Matrix[target1][(*A)[neighbor2]] and G2Matrix[target2][(*A)[neighbor2]])
                    || (neighbor2 == source1 and G2Matrix[target1][(*A)[neighbor1]] and G2Matrix[target1][target2] and G2Matrix[(*A)[neighbor1]][target2])){
@@ -3372,7 +3698,7 @@ double SANA::TCIncSwapOp(Job &job, uint source1, uint source2, uint target1, uin
                     deltaTriangles += 1;
                 }
             }
-        }    
+        }
     }
     return ((double)deltaTriangles/maxTriangles);
 }
@@ -3411,6 +3737,7 @@ int SANA::squaredAligEdgesIncSwapOp(Job &job, uint source1, uint source2, uint t
     }
     return res;
 }
+
 double SANA::WECIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2) {
     vector<uint> *A = job.info.A;
 
@@ -3474,6 +3801,88 @@ double SANA::localScoreSumIncSwapOp(Job &job, vector<vector<float> > const & sim
     return sim[source1][target2] - sim[source1][target1] + sim[source2][target1] - sim[source2][target2];
 }
 
+double SANA::edgeDifferenceIncChangeOp(Job &job, uint source, uint oldTarget, uint newTarget) {
+   vector<uint> *A = job.info.A;
+   double edgeDifferenceIncDiff = 0;
+   double c = 0;
+   for (uint node2 = 0; node2 < n1; ++node2) {
+       double y = -abs(G1FloatWeights[source][node2] - G2FloatWeights[oldTarget][(*A)[node2]])
+                  - c;
+       double t = edgeDifferenceIncDiff + y;
+       c = (t - edgeDifferenceIncDiff) - y;
+       edgeDifferenceIncDiff = t;
+
+       uint node2Target = node2 == source ? newTarget : (*A)[node2];
+       y = +abs(G1FloatWeights[source][node2] - G2FloatWeights[newTarget][node2Target])
+                  - c;
+       t = edgeDifferenceIncDiff + y;
+       c = (t - edgeDifferenceIncDiff) - y;
+       edgeDifferenceIncDiff = t; 
+   }
+
+
+   return edgeDifferenceIncDiff;
+}
+
+double SANA::edgeDifferenceIncSwapOp(Job &job, uint source1, uint source2, uint target1, uint target2) {
+    vector<uint> *A = job.info.A;
+    if (source1 == source2) {
+        return 0;
+    }
+
+    // Subtract source1-target1
+    // Add source1-target2
+    double edgeDifferenceIncDiff = 0;
+    double c = 0;
+    for (uint node2 = 0; node2 < n1; ++node2) {
+        double y = -abs(G1FloatWeights[source1][node2] - G2FloatWeights[target1][(*A)[node2]])
+                  - c;
+        double t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t;
+ 
+        uint node2Target = 0;
+        if (node2 == source1) {
+            node2Target = target2;
+        } else if (node2 == source2) {
+            node2Target = target1;
+        } else {
+            node2Target = (*A)[node2];
+        }
+        y = +abs(G1FloatWeights[source1][node2] - G2FloatWeights[target2][node2Target])
+           - c;
+        t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t; 
+   }
+
+    // Subtract source2-target2
+    // Add source2-target1
+    for (uint node2 = 0; node2 < n1; ++node2) {
+        if (node2 == source1) continue;
+        double y = -abs(G1FloatWeights[source2][node2] - G2FloatWeights[target2][(*A)[node2]])
+                  - c;
+        double t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t;
+ 
+        uint node2Target = 0;
+        if (node2 == source2) {
+            node2Target = target1;
+        } else {
+            node2Target = (*A)[node2];
+        }
+        y = +abs(G1FloatWeights[source2][node2] - G2FloatWeights[target1][node2Target])
+           - c;
+        t = edgeDifferenceIncDiff + y;
+        c = (t - edgeDifferenceIncDiff) - y;
+        edgeDifferenceIncDiff = t; 
+   }
+
+    return edgeDifferenceIncDiff;
+}
+
+
 inline uint SANA::G1RandomUnlockedNode(Job &job, uint source1) {
     if(!nodesHaveType){
         return G1RandomUnlockedNode(job);
@@ -3484,16 +3893,16 @@ inline uint SANA::G1RandomUnlockedNode(Job &job, uint source1) {
             if(isGene)
                 return G1RandomUnlockedGeneDist(job.gen);
             else
-                return G1->unlockedGeneCount + G1RandomUnlockedmiRNADist(job.gen);    
-        #else       
+                return G1->unlockedGeneCount + G1RandomUnlockedmiRNADist(job.gen);
+        #else
             bool isGene = G1->nodeTypes[source1] == Graph::NODE_TYPE_GENE;
             if(isGene){
                 int index = G1RandomUnlockedGeneDist(job.gen);
-                return G1->geneIndexList[index]; 
+                return G1->geneIndexList[index];
             }
             else{
                 int index =  G1RandomUnlockedmiRNADist(job.gen);
-                return G1->miRNAIndexList[index]; 
+                return G1->miRNAIndexList[index];
             }
         #endif
     }

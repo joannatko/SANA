@@ -1,8 +1,8 @@
 CC = g++
 
 #CXXFLAGS = -I "src/utils" -Wall -fno-inline -O2 -std=c++11 -g3
-#CXXFLAGS = -I "src/utils" -U__STRICT_ANSI__ -Wall -std=c++11 -O3 -DWEIGHTED #-pg -ggdb -Bstatic #-static 
-CXXFLAGS = -I "src/utils" -U__STRICT_ANSI__ -Wall -std=c++11 -O3 -pthread #-DUSE_CACHED_FILES #-DSPARSE #-DWEIGHTED -DCORES -ggdb #-pg
+#CXXFLAGS = -I "src/utils" -U__STRICT_ANSI__ -Wall -std=c++11 -O3 -DMULTI_PAIRWISE #-pg -ggdb -Bstatic #-static 
+CXXFLAGS = -I "src/utils" -U__STRICT_ANSI__ -Wall -std=c++11 -O3 -pthread #-DUSE_CACHED_FILES #-DSPARSE #-DMULTI_PAIRWISE -DCORES -ggdb #-pg
 
 INCLUDES =
 LFLAGS =
@@ -18,7 +18,7 @@ UTILS_SRC = 								\
 	src/utils/SeedMatrix.cpp					\
 	src/utils/LinearRegression.cpp					\
 	src/utils/ParetoFront.cpp                                       \
-        src/utils/Matrix.cpp                                            
+	src/utils/Matrix.cpp                                            
 
 ARGUMENTS_SRC = 							\
 	src/arguments/ArgumentParser.cpp				\
@@ -31,9 +31,10 @@ ARGUMENTS_SRC = 							\
 
 MEASURES_SRCS = 							\
 	src/measures/EdgeCorrectness.cpp 				\
+	src/measures/EdgeDifference.cpp         \
 	src/measures/TriangleCorrectness.cpp			\
 	src/measures/MultiEdgeCorrectness.cpp 				\
-        src/measures/ExternalWeightedEdgeConservation.cpp               \
+	src/measures/ExternalWeightedEdgeConservation.cpp               \
 	src/measures/GoAverage.cpp      				\
 	src/measures/NetGO.cpp      				\
 	src/measures/InducedConservedStructure.cpp			\
@@ -44,8 +45,9 @@ MEASURES_SRCS = 							\
 	src/measures/NodeCorrectness.cpp 				\
 	src/measures/ShortestPathConservation.cpp 			\
 	src/measures/SymmetricSubstructureScore.cpp 			\
-        src/measures/SymmetricEdgeCoverage.cpp 				\
-        src/measures/SquaredEdgeScore.cpp 				\
+	src/measures/SymmetricEdgeCoverage.cpp 				\
+	src/measures/SquaredEdgeScore.cpp 				\
+	src/measures/EdgeExposure.cpp 				\
 	src/measures/WeightedEdgeConservation.cpp 			\
 	src/measures/localMeasures/EdgeCount.cpp 			\
 	src/measures/localMeasures/EdgeDensity.cpp 			\
